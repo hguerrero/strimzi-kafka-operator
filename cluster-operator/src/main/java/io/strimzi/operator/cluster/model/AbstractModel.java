@@ -641,6 +641,7 @@ public abstract class AbstractModel {
     protected Volume createSecretVolume(String name, String secretName) {
 
         SecretVolumeSource secretVolumeSource = new SecretVolumeSourceBuilder()
+                .withDefaultMode(288)
                 .withSecretName(secretName)
                 .build();
 
