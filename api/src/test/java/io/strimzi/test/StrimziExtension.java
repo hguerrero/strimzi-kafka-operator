@@ -1,3 +1,7 @@
+/*
+ * Copyright 2018, Strimzi authors.
+ * License: Apache License 2.0 (see the file LICENSE or http://apache.org/licenses/LICENSE-2.0.html).
+ */
 package io.strimzi.test;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -6,7 +10,6 @@ import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.dataformat.yaml.YAMLMapper;
 import io.strimzi.api.kafka.model.Kafka;
-import io.strimzi.api.kafka.model.KafkaConnect;
 import io.strimzi.test.k8s.HelmClient;
 import io.strimzi.test.k8s.KubeClient;
 import io.strimzi.test.k8s.KubeClusterResource;
@@ -15,24 +18,29 @@ import org.apache.logging.log4j.Logger;
 import org.junit.ClassRule;
 import org.junit.jupiter.api.extension.AfterAllCallback;
 import org.junit.jupiter.api.extension.BeforeAllCallback;
-import org.junit.jupiter.api.extension.Extension;
 import org.junit.jupiter.api.extension.ExtensionContext;
-import org.junit.runners.model.*;
+import org.junit.runners.model.Annotatable;
+import org.junit.runners.model.InitializationError;
+import org.junit.runners.model.Statement;
+import org.junit.runners.model.TestClass;
+import org.junit.runners.model.FrameworkMethod;
+import org.junit.runners.model.FrameworkField;
 
 import java.io.File;
 import java.io.IOException;
 import java.lang.annotation.Annotation;
 import java.lang.annotation.Repeatable;
 import java.lang.reflect.Method;
-import java.nio.file.Path;
-import java.util.*;
+import java.util.Arrays;
+import java.util.ArrayList;
+import java.util.Map;
+import java.util.List;
+import java.util.LinkedHashMap;
+import java.util.Stack;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
 
-import static io.strimzi.test.TestUtils.entriesToMap;
-import static io.strimzi.test.TestUtils.entry;
 import static io.strimzi.test.TestUtils.indent;
 import static java.util.Arrays.asList;
 import static java.util.Collections.emptyList;
@@ -68,13 +76,13 @@ public class StrimziExtension implements AfterAllCallback, BeforeAllCallback {
 
     @Override
     public void afterAll(ExtensionContext context) throws Exception {
-        System.out.println("afterALL");
+//        System.out.println("afterALL");
         deleteResource((Bracket) statement);
     }
 
     @Override
     public void beforeAll(ExtensionContext context) throws Exception {
-        System.out.println("beforeALL");
+//        System.out.println("beforeALL");
 
         Class klass = context.getTestClass().orElse(null);
         testClass = new TestClass(klass);
@@ -92,6 +100,7 @@ public class StrimziExtension implements AfterAllCallback, BeforeAllCallback {
             };
             statement = withClusterOperator(testClass, statement);
             statement = withNamespaces(testClass, statement);
+            statement = withKafkaClusters(testClass, statement);
         }
         try {
             Bracket current = (Bracket) statement;
@@ -557,6 +566,63 @@ public class StrimziExtension implements AfterAllCallback, BeforeAllCallback {
                 kubeClient().waitForResourceDeletion("deployment", CO_DEPLOYMENT_NAME);
             }
         };
+        return last;
+    }
+
+    private Statement withKafkaClusters(Annotatable element,
+                                        Statement statement) {
+        Statement last = statement;
+        KafkaFromClasspathYaml cluster = element.getAnnotation(KafkaFromClasspathYaml.class);
+        if (cluster != null) {
+            String[] resources = cluster.value().length == 0 ? new String[]{classpathResourceName(element)} : cluster.value();
+            for (String resource : resources) {
+                // use the example kafka-ephemeral as a template, but modify it according to the annotation
+                String yaml = TestUtils.readResource(testClass(element), resource);
+                Kafka kafkaAssembly = TestUtils.fromYamlString(yaml, Kafka.class);
+                final String kafkaStatefulSetName = kafkaAssembly.getMetadata().getName() + "-kafka";
+                final String zookeeperStatefulSetName = kafkaAssembly.getMetadata().getName() + "-zookeeper";
+                final String eoDeploymentName = kafkaAssembly.getMetadata().getName() + "-entity-operator";
+                last = new StrimziExtension.Bracket(last, new StrimziExtension.ResourceAction()
+                        .getPo(CO_DEPLOYMENT_NAME + ".*")
+                        .logs(CO_DEPLOYMENT_NAME + ".*", "strimzi-cluster-operator")
+                        .getDep(CO_DEPLOYMENT_NAME)
+                        .getSs(kafkaStatefulSetName)
+                        .getPo(kafkaStatefulSetName + ".*")
+                        .logs(kafkaStatefulSetName + ".*", "kafka")
+                        .logs(kafkaStatefulSetName + ".*", "tls-sidecar")
+                        .getSs(zookeeperStatefulSetName)
+                        .getPo(zookeeperStatefulSetName)
+                        .logs(zookeeperStatefulSetName + ".*", "zookeeper")
+                        .getDep(eoDeploymentName)
+                        .logs(eoDeploymentName + ".*", "entity-operator")) {
+
+                    @Override
+                    protected void before() {
+                        LOGGER.info("Creating kafka cluster '{}' before test per @KafkaCluster annotation on {}", kafkaAssembly.getMetadata().getName(), name(element));
+                        // create cm
+                        kubeClient().clientWithAdmin().applyContent(yaml);
+                        // wait for ss
+                        LOGGER.info("Waiting for Zookeeper SS");
+                        kubeClient().waitForStatefulSet(zookeeperStatefulSetName, kafkaAssembly.getSpec().getZookeeper().getReplicas());
+                        // wait for ss
+                        LOGGER.info("Waiting for Kafka SS");
+                        kubeClient().waitForStatefulSet(kafkaStatefulSetName, kafkaAssembly.getSpec().getKafka().getReplicas());
+                        // wait for EO
+                        LOGGER.info("Waiting for Entity Operator Deployment");
+                        kubeClient().waitForDeployment(eoDeploymentName, 1);
+                    }
+
+                    @Override
+                    protected void after() {
+                        LOGGER.info("Deleting kafka cluster '{}' after test per @KafkaCluster annotation on {}", kafkaAssembly.getMetadata().getName(), name(element));
+                        // delete cm
+                        kubeClient().clientWithAdmin().deleteContent(yaml);
+                        // wait for ss to go
+                        kubeClient().waitForResourceDeletion("statefulset", kafkaStatefulSetName);
+                    }
+                };
+            }
+        }
         return last;
     }
 

@@ -36,6 +36,8 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.ClassRule;
 import org.junit.Rule;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.rules.Stopwatch;
 
 import java.util.ArrayList;
@@ -371,11 +373,13 @@ public class AbstractST {
     }
 
     @Before
+    @BeforeEach
     public void createResources() {
         resources = new Resources(namespacedClient());
     }
 
     @After
+    @AfterEach
     public void deleteResources() {
         LOGGER.info("Deleting resources after the test");
         resources.deleteResources();
