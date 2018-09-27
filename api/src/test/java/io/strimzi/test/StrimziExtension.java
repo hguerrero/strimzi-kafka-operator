@@ -10,15 +10,12 @@ import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.dataformat.yaml.YAMLMapper;
 import io.strimzi.api.kafka.model.Kafka;
-import io.strimzi.test.k8s.HelmClient;
-import io.strimzi.test.k8s.KubeClient;
-import io.strimzi.test.k8s.KubeClusterResource;
+import io.strimzi.api.kafka.model.KafkaConnect;
+import io.strimzi.test.k8s.*;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.junit.ClassRule;
-import org.junit.jupiter.api.extension.AfterAllCallback;
-import org.junit.jupiter.api.extension.BeforeAllCallback;
-import org.junit.jupiter.api.extension.ExtensionContext;
+import org.junit.jupiter.api.extension.*;
 import org.junit.runners.model.Annotatable;
 import org.junit.runners.model.InitializationError;
 import org.junit.runners.model.Statement;
@@ -31,22 +28,21 @@ import java.io.IOException;
 import java.lang.annotation.Annotation;
 import java.lang.annotation.Repeatable;
 import java.lang.reflect.Method;
-import java.util.Arrays;
-import java.util.ArrayList;
-import java.util.Map;
-import java.util.List;
-import java.util.LinkedHashMap;
-import java.util.Stack;
+import java.nio.file.Path;
+import java.util.*;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
+import static io.strimzi.test.TestUtils.entriesToMap;
+import static io.strimzi.test.TestUtils.entry;
 import static io.strimzi.test.TestUtils.indent;
 import static java.util.Arrays.asList;
 import static java.util.Collections.emptyList;
 import static java.util.Collections.singletonList;
 
-public class StrimziExtension implements AfterAllCallback, BeforeAllCallback {
+public class StrimziExtension implements AfterAllCallback, BeforeAllCallback, AfterEachCallback, BeforeEachCallback {
     private static final Logger LOGGER = LogManager.getLogger(StrimziExtension.class);
 
     public static final String KAFKA_PERSISTENT_YAML = "../examples/kafka/kafka-persistent.yaml";
@@ -75,15 +71,49 @@ public class StrimziExtension implements AfterAllCallback, BeforeAllCallback {
     }
 
     @Override
+    public void afterEach(ExtensionContext context) throws Exception {
+        deleteResource((Bracket) statement);
+    }
+
+    @Override
+    public void beforeEach(ExtensionContext context) throws Exception {
+        statement = new StrimziExtension.Bracket(null, () -> e -> {
+            LOGGER.info("Failed to set up test class {}, due to {}", testClass.getName(), e, e);
+        }) {
+            @Override
+            protected void before() {
+            }
+
+            @Override
+            protected void after() {
+            }
+        };
+        statement = withClusterOperator(testClass, statement);
+        statement = withNamespaces(testClass, statement);
+        statement = withKafkaClusters(testClass, statement);
+        statement = withConnectS2IClusters(testClass, statement);
+        statement = withConnectClusters(testClass, statement);
+        statement = withResources(testClass, statement);
+        statement = withTopic(testClass, statement);
+        statement = withLogging(testClass, statement);
+        try {
+            Bracket current = (Bracket) statement;
+            while (current != null) {
+                current.before();
+                current = (Bracket) current.statement;
+            }
+        } catch (Throwable throwable) {
+            throwable.printStackTrace();
+        }
+    }
+
+    @Override
     public void afterAll(ExtensionContext context) throws Exception {
-//        System.out.println("afterALL");
         deleteResource((Bracket) statement);
     }
 
     @Override
     public void beforeAll(ExtensionContext context) throws Exception {
-//        System.out.println("beforeALL");
-
         Class klass = context.getTestClass().orElse(null);
         testClass = new TestClass(klass);
         if (!areAllChildrenIgnored()) {
@@ -101,6 +131,11 @@ public class StrimziExtension implements AfterAllCallback, BeforeAllCallback {
             statement = withClusterOperator(testClass, statement);
             statement = withNamespaces(testClass, statement);
             statement = withKafkaClusters(testClass, statement);
+            statement = withConnectS2IClusters(testClass, statement);
+            statement = withConnectClusters(testClass, statement);
+            statement = withResources(testClass, statement);
+            statement = withTopic(testClass, statement);
+            statement = withLogging(testClass, statement);
         }
         try {
             Bracket current = (Bracket) statement;
@@ -118,6 +153,69 @@ public class StrimziExtension implements AfterAllCallback, BeforeAllCallback {
             deleteResource((Bracket) resource.statement);
             resource.after();
         }
+    }
+
+    private boolean isWrongClusterType(Annotatable annotated, FrameworkMethod test) {
+        boolean result = annotated.getAnnotation(OpenShiftOnly.class) != null
+                && !(clusterResource().cluster() instanceof OpenShift
+                || clusterResource().cluster() instanceof Minishift);
+        if (result) {
+            LOGGER.info("{} is @OpenShiftOnly, but the running cluster is not OpenShift: Ignoring {}", name(annotated), name(test));
+        }
+        return result;
+    }
+
+    private boolean isIgnoredByTestGroup(Annotatable annotated, FrameworkMethod test) {
+        JUnitGroup testGroup = annotated.getAnnotation(JUnitGroup.class);
+        if (testGroup == null) {
+            return false;
+        }
+        Collection<String> enabledGroups = getEnabledGroups(testGroup.systemProperty());
+        Collection<String> declaredGroups = getDeclaredGroups(testGroup);
+        if (isGroupEnabled(enabledGroups, declaredGroups)) {
+            LOGGER.info("Test group {} is enabled for method {}. Enabled test groups: {}",
+                    declaredGroups, test.getName(), enabledGroups);
+            return false;
+        }
+        LOGGER.info("None of the test groups {} are enabled for method {}. Enabled test groups: {}",
+                declaredGroups, test.getName(), enabledGroups);
+        return true;
+    }
+
+    private static Collection<String> getEnabledGroups(String key) {
+        return splitProperties((String) System.getProperties().getOrDefault(key, JUnitGroup.ALL_GROUPS));
+    }
+
+    private static Collection<String> getDeclaredGroups(JUnitGroup testGroup) {
+        String[] declaredGroups = testGroup.name();
+        return new HashSet<>(Arrays.asList(declaredGroups));
+    }
+
+    private static Collection<String> splitProperties(String commaSeparated) {
+        if (commaSeparated == null || commaSeparated.trim().isEmpty()) {
+            return Collections.emptySet();
+        }
+        return new HashSet<>(Arrays.asList(commaSeparated.split(",+")));
+    }
+
+    /**
+     * A test group is enabled if {@link JUnitGroup#ALL_GROUPS} is defined or
+     * the declared test groups contain at least one defined test group
+     *
+     * @param enabledGroups  Test groups that are enabled for execution.
+     * @param declaredGroups Test groups that are declared in the {@link JUnitGroup} annotation.
+     * @return boolean name with actual status
+     */
+    private static boolean isGroupEnabled(Collection<String> enabledGroups, Collection<String> declaredGroups) {
+        if (enabledGroups.contains(JUnitGroup.ALL_GROUPS) || (enabledGroups.isEmpty() && declaredGroups.isEmpty())) {
+            return true;
+        }
+        for (String enabledGroup : enabledGroups) {
+            if (declaredGroups.contains(enabledGroup)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private boolean areAllChildrenIgnored() {
@@ -194,12 +292,13 @@ public class StrimziExtension implements AfterAllCallback, BeforeAllCallback {
     /**
      * Get the (possibly @Repeatable) annotations on the given element.
      *
-     * @param element
-     * @param annotationType
-     * @param <A>
-     * @return
+     * @param element @TODO
+     * @param annotationType @TODO
+     * @param <A> @TODO
+     * @return @TODO
      */
-    <A extends Annotation> List<A> annotations(Annotatable element, Class<A> annotationType) {
+    @SuppressWarnings("unchecked")
+    private <A extends Annotation> List<A> annotations(Annotatable element, Class<A> annotationType) {
         final List<A> list;
         A c = element.getAnnotation(annotationType);
         if (c != null) {
@@ -401,33 +500,6 @@ public class StrimziExtension implements AfterAllCallback, BeforeAllCallback {
         }
     }
 
-    class NamespacesExtension implements BeforeAllCallback, AfterAllCallback {
-        String previousNamespace;
-        TestClass element;
-
-        @Override
-        public void beforeAll(ExtensionContext context) throws Exception {
-            element = new TestClass(context.getTestClass().get());
-            for (Namespace namespace : annotations(element, Namespace.class)) {
-                LOGGER.info("Creating namespace '{}' before test per @Namespace annotation on {}", namespace.value(), name(element));
-                kubeClient().createNamespace(namespace.value());
-                if (previousNamespace == null) {
-                    previousNamespace = namespace.use() ? kubeClient().namespace(namespace.value()) : kubeClient().namespace();
-                }
-            }
-        }
-
-        @Override
-        public void afterAll(ExtensionContext context) throws Exception {
-            for (Namespace namespace : annotations(element, Namespace.class)) {
-                LOGGER.info("Deleting namespace '{}' after test per @Namespace annotation on {}", namespace.value(), name(element));
-                kubeClient().deleteNamespace(namespace.value());
-
-            }
-            kubeClient().namespace(previousNamespace);
-        }
-    }
-
     Class<?> testClass(Annotatable a) {
         if (a instanceof TestClass) {
             return ((TestClass) a).getJavaClass();
@@ -460,7 +532,11 @@ public class StrimziExtension implements AfterAllCallback, BeforeAllCallback {
         Statement last = statement;
         for (ClusterOperator cc : annotations(element, ClusterOperator.class)) {
             boolean useHelmChart = cc.useHelmChart() || Boolean.parseBoolean(System.getProperty("useHelmChart", Boolean.FALSE.toString()));
-            last = installOperatorFromExamples(element, last, cc);
+            if (useHelmChart) {
+                last = installOperatorFromHelmChart(element, last, cc);
+            } else {
+                last = installOperatorFromExamples(element, last, cc);
+            }
         }
         return last;
     }
@@ -490,6 +566,7 @@ public class StrimziExtension implements AfterAllCallback, BeforeAllCallback {
         return last;
     }
 
+    @SuppressWarnings("unchecked")
     private Statement installOperatorFromExamples(Annotatable element, Statement last, ClusterOperator cc) {
         Map<File, String> yamls = Arrays.stream(new File(CO_INSTALL_DIR).listFiles()).sorted().collect(Collectors.toMap(file -> file, f -> getContent(f, node -> {
             // Change the docker org of the images in the 04-deployment.yaml
@@ -569,6 +646,57 @@ public class StrimziExtension implements AfterAllCallback, BeforeAllCallback {
         return last;
     }
 
+    @SuppressWarnings("unchecked")
+    private Statement installOperatorFromHelmChart(Annotatable element, Statement last, ClusterOperator cc) {
+        String dockerOrg = System.getenv().getOrDefault("DOCKER_ORG", STRIMZI_ORG);
+        String dockerTag = System.getenv().getOrDefault("DOCKER_TAG", STRIMZI_TAG);
+
+        Map<String, String> values = Collections.unmodifiableMap(Stream.of(
+                entry("imageRepositoryOverride", dockerOrg),
+                entry("imageTagOverride", dockerTag),
+                entry("image.pullPolicy", IMAGE_PULL_POLICY),
+                entry("resources.requests.memory", REQUESTS_MEMORY),
+                entry("resources.requests.cpu", REQUESTS_CPU),
+                entry("resources.limits.memory", LIMITS_MEMORY),
+                entry("resources.limits.cpu", LIMITS_CPU),
+                entry("logLevel", OPERATOR_LOG_LEVEL))
+                .collect(entriesToMap()));
+
+        /** These entries aren't applied to the deployment yaml at this time */
+        Map<String, String> envVars = Collections.unmodifiableMap(Arrays.stream(cc.envVariables())
+                .map(var -> entry(String.format("env.%s", var.key()), var.value()))
+                .collect(entriesToMap()));
+
+        Map<String, String> allValues = Stream.of(values, envVars).flatMap(m -> m.entrySet().stream())
+                .collect(entriesToMap());
+
+        last = new StrimziExtension.Bracket(last, new StrimziExtension.ResourceAction().getPo(CO_DEPLOYMENT_NAME + ".*")
+                .logs(CO_DEPLOYMENT_NAME + ".*", null)
+                .getDep(CO_DEPLOYMENT_NAME)) {
+            @Override
+            protected void before() {
+                // Here we record the state of the cluster
+                LOGGER.info("Creating cluster operator with Helm Chart {} before test per @ClusterOperator annotation on {}", cc, name(element));
+                Path pathToChart = new File(HELM_CHART).toPath();
+                String oldNamespace = kubeClient().namespace("kube-system");
+                String pathToHelmServiceAccount = Objects.requireNonNull(getClass().getClassLoader().getResource("helm/helm-service-account.yaml")).getPath();
+                String helmServiceAccount = TestUtils.getFileAsString(pathToHelmServiceAccount);
+                kubeClient().applyContent(helmServiceAccount);
+                helmClient().init();
+                kubeClient().namespace(oldNamespace);
+                helmClient().install(pathToChart, HELM_RELEASE_NAME, allValues);
+            }
+
+            @Override
+            protected void after() {
+                LOGGER.info("Deleting cluster operator with Helm Chart {} after test per @ClusterOperator annotation on {}", cc, name(element));
+                helmClient().delete(HELM_RELEASE_NAME);
+            }
+        };
+        return last;
+    }
+
+    @SuppressWarnings("unchecked")
     private Statement withKafkaClusters(Annotatable element,
                                         Statement statement) {
         Statement last = statement;
@@ -626,6 +754,85 @@ public class StrimziExtension implements AfterAllCallback, BeforeAllCallback {
         return last;
     }
 
+    @SuppressWarnings("unchecked")
+    private Statement withConnectS2IClusters(Annotatable element,
+                                             Statement statement) {
+        Statement last = statement;
+        KafkaConnectS2IFromClasspathYaml cluster = element.getAnnotation(KafkaConnectS2IFromClasspathYaml.class);
+        if (cluster != null) {
+            String[] resources = cluster.value().length == 0 ? new String[]{classpathResourceName(element)} : cluster.value();
+            for (String resource : resources) {
+                // use the example kafka-ephemeral as a template, but modify it according to the annotation
+                String yaml = TestUtils.readResource(testClass(element), resource);
+                KafkaConnect kafkaAssembly = TestUtils.fromYamlString(yaml, KafkaConnect.class);
+                String clusterName = kafkaAssembly.getMetadata().getName();
+                final String deploymentName = clusterName + "-connect";
+                last = new StrimziExtension.Bracket(last, new StrimziExtension.ResourceAction()
+                        .getDep(deploymentName)
+                        .getPo(deploymentName + ".*")
+                        .logs(deploymentName + ".*", null)) {
+                    @Override
+                    protected void before() {
+                        LOGGER.info("Creating connect cluster '{}' before test per @ConnectCluster annotation on {}", clusterName, name(element));
+                        // create cm
+                        kubeClient().clientWithAdmin().applyContent(yaml);
+                        // wait for deployment config
+                        kubeClient().waitForDeploymentConfig(deploymentName);
+                    }
+
+                    @Override
+                    protected void after() {
+                        LOGGER.info("Deleting connect cluster '{}' after test per @ConnectCluster annotation on {}", clusterName, name(element));
+                        // delete cm
+                        kubeClient().clientWithAdmin().deleteContent(yaml);
+                        // wait for ss to go
+                        kubeClient().waitForResourceDeletion("deploymentConfig", deploymentName);
+                    }
+                };
+            }
+        }
+        return last;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Statement withConnectClusters(Annotatable element,
+                                          Statement statement) {
+        Statement last = statement;
+        KafkaConnectFromClasspathYaml cluster = element.getAnnotation(KafkaConnectFromClasspathYaml.class);
+        if (cluster != null) {
+            String[] resources = cluster.value().length == 0 ? new String[]{classpathResourceName(element)} : cluster.value();
+            for (String resource : resources) {
+                // use the example kafka-ephemeral as a template, but modify it according to the annotation
+                String yaml = TestUtils.readResource(testClass(element), resource);
+                KafkaConnect kafkaAssembly = TestUtils.fromYamlString(yaml, KafkaConnect.class);
+                String clusterName = kafkaAssembly.getMetadata().getName();
+                final String deploymentName = clusterName + "-connect";
+                last = new StrimziExtension.Bracket(last, new StrimziExtension.ResourceAction()
+                        .getDep(deploymentName)
+                        .getPo(deploymentName + ".*")
+                        .logs(deploymentName + ".*", null)) {
+                    @Override
+                    protected void before() {
+                        LOGGER.info("Creating connect cluster '{}' before test per @ConnectCluster annotation on {}", clusterName, name(element));
+                        // create cm
+                        kubeClient().clientWithAdmin().applyContent(yaml);
+                        // wait for deployment
+                        kubeClient().waitForDeployment(deploymentName, kafkaAssembly.getSpec().getReplicas());
+                    }
+
+                    @Override
+                    protected void after() {
+                        LOGGER.info("Deleting connect cluster '{}' after test per @ConnectCluster annotation on {}", clusterName, name(element));
+                        // delete cm
+                        kubeClient().clientWithAdmin().deleteContent(yaml);
+                        // wait for ss to go
+                        kubeClient().waitForResourceDeletion("deployment", deploymentName);
+                    }
+                };
+            }
+        }
+        return last;
+    }
 
     private Statement withResources(Annotatable element,
                                     Statement statement) {
@@ -657,6 +864,75 @@ public class StrimziExtension implements AfterAllCallback, BeforeAllCallback {
             };
         }
         return last;
+    }
+
+    private Statement withTopic(Annotatable element, Statement statement) {
+        Statement last = statement;
+        for (Topic topic : annotations(element, Topic.class)) {
+            final JsonNodeFactory factory = JsonNodeFactory.instance;
+            final ObjectNode node = factory.objectNode();
+            node.put("apiVersion", "v1");
+            node.put("kind", "ConfigMap");
+            node.putObject("metadata");
+            JsonNode metadata = node.get("metadata");
+            ((ObjectNode) metadata).put("name", topic.name());
+            ((ObjectNode) metadata).putObject("labels");
+            JsonNode labels = metadata.get("labels");
+            ((ObjectNode) labels).put("strimzi.io/kind", "topic");
+            ((ObjectNode) labels).put("strimzi.io/cluster", topic.clusterName());
+            node.putObject("data");
+            JsonNode data = node.get("data");
+            ((ObjectNode) data).put("name", topic.name());
+            ((ObjectNode) data).put("partitions", topic.partitions());
+            ((ObjectNode) data).put("replicas", topic.replicas());
+            String configMap = node.toString();
+            last = new StrimziExtension.Bracket(last, null) {
+                @Override
+                protected void before() {
+                    LOGGER.info("Creating Topic {} {}", topic.name(), name(element));
+                    // create cm
+                    kubeClient().applyContent(configMap);
+                    kubeClient().waitForResourceCreation(BaseKubeClient.CM, topic.name());
+                }
+
+                @Override
+                protected void after() {
+                    LOGGER.info("Deleting ConfigMap '{}' after test per @Topic annotation on {}", topic.clusterName(), name(element));
+                    // delete cm
+                    kubeClient().deleteContent(configMap);
+                    kubeClient().waitForResourceDeletion(BaseKubeClient.CM, topic.name());
+                }
+            };
+        }
+        return last;
+    }
+
+
+    private Statement withLogging(Annotatable element, Statement statement) {
+        return new StrimziExtension.Bracket(statement, null) {
+            private long t0;
+
+            @Override
+            protected void before() {
+                t0 = System.currentTimeMillis();
+                LOGGER.info("Starting {}", name(element));
+            }
+
+            @Override
+            protected void after() {
+                LOGGER.info("Finished {}: took {}",
+                        name(element),
+                        duration(System.currentTimeMillis() - t0));
+            }
+        };
+    }
+
+    private static String duration(long millis) {
+        long ms = millis % 1_000;
+        long time = millis / 1_000;
+        long minutes = time / 60;
+        long seconds = time % 60;
+        return minutes + "m" + seconds + "." + ms + "s";
     }
 
 }
