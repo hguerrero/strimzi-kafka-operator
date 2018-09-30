@@ -1,5 +1,9 @@
 # CHANGELOG
 
+## 0.8.0
+
+* Support for unencrypted connections on LoadBalancers and NodePorts.
+
 ## 0.7.0
 
 * Exposing Kafka to the outside using:
